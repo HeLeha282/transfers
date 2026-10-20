@@ -8,7 +8,7 @@
 
 | Сценарий | Что случится при наивной реализации | Чем закрываем |
 |---|---|---|
-| Клиент нажал «Перевести» дважды при плохой сети | Деньги спишутся дважды | Идемпотентность (`Idempotency-Key`, `operation_id`) |
+| Клиент нажал «Перевести» дважды при плохой сети | Деньги спишутся дважды | Идемпотентность (`Idempotency-Key`, уникальность операции в ledger) |
 | Два перевода с одного счёта одновременно | Оба увидят старый баланс, счёт уйдёт в минус | ACID-транзакция + блокировка строки счёта в ledger |
 | Чужой банк не ответил вовремя | Вернём деньги, хотя они дошли (или наоборот) | Сага + recovery-воркер, не откатываем вслепую |
 | Клиент не понимает, что с переводом | Звонок в поддержку | Статусная машина, понятный статус |
@@ -48,10 +48,10 @@ flowchart LR
 ```mermaid
 flowchart LR
     C([Клиент]) -->|REST<br/>Idempotency-Key| T[transfer-service<br/>оркестратор]
-    T -->|gRPC<br/>operation_id| L[ledger-service<br/>учёт денег]
+    T -->|gRPC<br/>reference_id| L[ledger-service<br/>учёт денег]
     T -->|HTTP| S[sbp-emulator<br/>заглушка чужого банка]
     T --- TDB[(transfer DB<br/>transfers<br/>idempotency_keys<br/>outbox)]
-    L --- LDB[(ledger DB<br/>accounts, entries<br/>holds, ledger_operations)]
+    L --- LDB[(ledger DB<br/>accounts, entries<br/>holds, operations)]
     T -->|outbox → события| K{{Kafka}}
     K --> N[notification-service<br/>Kotlin]
     N --- NDB[(notification DB)]
@@ -81,57 +81,59 @@ flowchart LR
 erDiagram
     accounts ||--o{ entries : "проводки по счёту"
     accounts ||--o{ holds : "холды по счёту"
-    ledger_operations ||--o{ entries : "проводки, созданные вызовом"
+    operations ||--o{ entries : "проводки, созданные операцией"
+    operations ||--o| holds : "холд, поставленный операцией RESERVE"
     accounts {
-        bigint id PK
-        varchar client_id
-        char3 currency
+        bigint id PK "номер счёта; по нему порядок блокировок"
+        varchar type "CLIENT | SYSTEM"
+        varchar client_id "владелец; только у CLIENT"
+        varchar code UK "имя системного счёта; только у SYSTEM"
+        varchar currency "RUB"
         numeric balance "денормализовано, = SUM(entries.amount)"
         numeric reserved "денормализовано, = SUM(holds.amount) по ACTIVE"
-        varchar type "CLIENT | SYSTEM"
         varchar status "ACTIVE | BLOCKED | CLOSED"
+        timestamptz created_at
+    }
+    operations {
+        bigint id PK
+        uuid reference_id "документ-основание: id перевода или пополнения"
+        varchar type "DEPOSIT | TRANSFER | RESERVE | COMMIT_RESERVE | RELEASE_RESERVE"
+        varchar result "итог; возвращается при повторе"
         timestamptz created_at
     }
     entries {
         bigint id PK
-        uuid transfer_id "одна операция = минимум две проводки"
-        varchar operation_id FK "вызов ledger, создавший проводку"
+        bigint operation_id FK "операция, создавшая проводку"
         bigint account_id FK
-        numeric amount "минус = списание, плюс = зачисление"
-        varchar entry_type "FUNDING | TRANSFER | EXTERNAL_TRANSFER"
+        numeric amount "минус = списание, плюс = зачисление, не 0"
         timestamptz created_at
     }
     holds {
         bigint id PK
-        uuid transfer_id UK "один холд на перевод"
+        bigint operation_id FK "операция RESERVE; уникальна, один холд на перевод"
         bigint account_id FK
-        numeric amount
+        numeric amount "больше 0"
         varchar status "ACTIVE | COMMITTED | RELEASED"
-        timestamptz created_at
-    }
-    ledger_operations {
-        varchar operation_id PK "ключ идемпотентности вызова в ledger"
-        uuid transfer_id
-        varchar operation_type "TRANSFER | RESERVE | COMMIT_RESERVE | RELEASE_RESERVE"
-        varchar result "ответ на первый вызов, возвращается при повторе"
         timestamptz created_at
     }
 ```
 
+**Операция** — одно действие ledger над деньгами по одному документу-основанию. Документ-основание (`reference_id`) — это перевод из transfer-service или пополнение: его id генерирует вызывающая сторона. У одного перевода может быть несколько операций разных типов: например, `RESERVE`, затем `COMMIT_RESERVE`.
+
 Инварианты модели данных:
-- Двойная запись: каждая операция — минимум две проводки с общим `transfer_id`, их сумма равна 0. Следовательно, сумма всех проводок в системе равна 0: деньги не появляются и не исчезают, только перемещаются.
+- Двойная запись: каждая операция, двигающая деньги, создаёт минимум две проводки, их сумма равна 0. Следовательно, сумма всех проводок в системе равна 0: деньги не появляются и не исчезают, только перемещаются.
 - Проводки неизменяемые: только добавление. Ошибочная операция исправляется сторно — обратной проводкой, история сохраняется.
 - `balance` счёта всегда равен сумме его проводок и обновляется в той же транзакции, что и проводки.
 - Деньги поступают в систему через системный счёт `EXTERNAL_FUNDING` (`type = SYSTEM`), которому разрешён отрицательный баланс. Клиентский счёт в минус уйти не может.
 - Переводы в другие банки зачисляются на системный корреспондентский счёт `INTERBANK_SETTLEMENT`: на нём учитывается, сколько денег отправлено во внешние банки.
-- Каждый резерв хранится отдельной строкой в `holds`, по одному на перевод. `Reserve` создаёт холд в статусе `ACTIVE`; `CommitReserve` и `ReleaseReserve` находят его по `transfer_id` и берут сумму из него. Переходы возможны только из `ACTIVE`, поэтому холд нельзя списать или снять дважды.
+- Каждый резерв хранится отдельной строкой в `holds`, по одному на перевод. `Reserve` создаёт холд в статусе `ACTIVE`. Холд ссылается на операцию `RESERVE`, которая его поставила; `CommitReserve` и `ReleaseReserve` находят его через эту операцию (`reference_id` + тип `RESERVE`) и берут сумму из холда. Переходы возможны только из `ACTIVE`, поэтому холд нельзя списать или снять дважды.
 - Холд проводок не создаёт. Проводки появляются при фактическом списании (`CommitReserve`): счёт клиента → `INTERBANK_SETTLEMENT`.
 - `reserved` счёта всегда равен сумме его активных холдов и обновляется в той же транзакции, что и холды.
-- `ledger_operations` — журнал выполненных вызовов. Повторный вызов с тем же `operation_id` не выполняется заново, а возвращает сохранённый `result`.
-- Каждая проводка ссылается на вызов, который её создал (`entries.operation_id`). Проводка не может появиться без зарегистрированного вызова, и для любой проводки видно, каким вызовом она создана. Вызовы `RESERVE` и `RELEASE_RESERVE` проводок не создают.
-- Доступный остаток = `balance − reserved`. У клиентского счёта всегда `0 ≤ reserved ≤ balance`.
-- Списание и зачисление возможны только для счетов в статусе `ACTIVE`.
-- Запись в `ledger_operations` создаётся в той же транзакции, что и изменения денег. Фиксируются и отказы (например, недостаточно средств): повторный вызов возвращает тот же отказ, даже если за это время на счёт пришли деньги.
+- Доступный остаток = `balance − reserved`. У клиентского счёта всегда `0 ≤ reserved ≤ balance`; у системного `reserved = 0`.
+- **Идемпотентность:** пара `(reference_id, type)` уникальна. Повторный вызов того же типа по тому же документу не выполняется заново, а возвращает сохранённый `result`. Подробно: [ADR-005](adr/0005-idempotency.md).
+- Запись в `operations` создаётся в той же транзакции, что и изменения денег. Фиксируются и бизнес-отказы (например, недостаточно средств): повторный вызов возвращает тот же отказ, даже если за это время на счёт пришли деньги. Технические ошибки не фиксируются: транзакция откатывается целиком.
+- Списание и зачисление возможны только для счетов в статусе `ACTIVE`. Исключение — `CommitReserve` и `ReleaseReserve`: холд уже гарантировал деньги, поэтому они проходят и по заблокированному счёту.
+- На входе проверяется сумма: больше 0, не больше двух знаков после запятой; у перевода счета отправителя и получателя различаются. Нарушение — ошибка вызывающей стороны (`INVALID_ARGUMENT`), в `operations` не записывается.
 - Суммы хранятся как `NUMERIC(19,2)`, без чисел с плавающей точкой.
 
 ### 5.2 transfer DB
@@ -174,7 +176,7 @@ sequenceDiagram
 
     C->>T: POST /transfers (Idempotency-Key)
     T->>T: сохранить перевод NEW
-    T->>L: Transfer(operation_id, from, to, amount)
+    T->>L: Transfer(reference_id, from, to, amount)
     rect rgb(230, 240, 255)
     note over L,DB: одна ACID-транзакция, без сетевых вызовов внутри
     L->>DB: заблокировать оба счёта в порядке id
@@ -186,7 +188,7 @@ sequenceDiagram
         T->>T: NEW → COMPLETED
         T-->>C: COMPLETED
     else недостаточно средств или счёт не ACTIVE
-        L-->>T: отказ (сохранён в ledger_operations)
+        L-->>T: отказ (сохранён в operations)
         T->>T: NEW → FAILED
         T-->>C: FAILED
     end
@@ -205,7 +207,7 @@ sequenceDiagram
     participant S as sbp-emulator
     participant R as recovery-воркер
 
-    T->>L: Reserve(operation_id)
+    T->>L: Reserve(reference_id, account, amount)
     L-->>T: OK
     T->>T: NEW → RESERVED
     T->>T: RESERVED → SENT
@@ -213,12 +215,12 @@ sequenceDiagram
     T->>S: отправить перевод (transfer_id)
     alt ACCEPTED
         S-->>T: ACCEPTED
-        T->>L: CommitReserve(operation_id)
+        T->>L: CommitReserve(reference_id)
         L-->>T: OK
         T->>T: SENT → COMPLETED
     else REJECTED
         S-->>T: REJECTED
-        T->>L: ReleaseReserve(operation_id)
+        T->>L: ReleaseReserve(reference_id)
         L-->>T: OK
         T->>T: SENT → COMPENSATED
     else нет ответа за отведённое время
@@ -230,11 +232,11 @@ sequenceDiagram
         end
         S-->>R: ACCEPTED или REJECTED
         alt ACCEPTED
-            R->>L: CommitReserve(operation_id)
+            R->>L: CommitReserve(reference_id)
             L-->>R: OK
             R->>R: SENT → COMPLETED
         else REJECTED
-            R->>L: ReleaseReserve(operation_id)
+            R->>L: ReleaseReserve(reference_id)
             L-->>R: OK
             R->>R: SENT → COMPENSATED
         end
@@ -250,7 +252,7 @@ Recovery-воркер — фоновый процесс внутри transfer-se
 
 | Статус зависшего перевода | Что могло произойти | Действие recovery |
 |---|---|---|
-| `NEW` | Вызов ledger мог выполниться, но ответ не сохранён | Повторить вызов ledger с тем же `operation_id`: ledger вернёт результат первого вызова или выполнит его сейчас |
+| `NEW` | Вызов ledger мог выполниться, но ответ не сохранён | Повторить вызов ledger с тем же `reference_id`: ledger вернёт результат первого вызова или выполнит его сейчас |
 | `RESERVED` | Холд есть, запрос в чужой банк точно не отправлялся | Продолжить сагу: `RESERVED → SENT` и отправка |
 | `SENT` | Запрос мог уйти | Повторно отправить запрос с тем же `transfer_id` до точного ответа |
 
@@ -265,19 +267,23 @@ Recovery-воркер — фоновый процесс внутри transfer-se
 | `POST /api/v1/transfers` + заголовок `Idempotency-Key` | Создать перевод. Повтор с тем же ключом возвращает тот же перевод, а не создаёт новый |
 | `GET /api/v1/transfers/{id}` | Узнать статус перевода |
 
+Тип перевода определяется получателем, которого указал клиент, а не поиском счетов: `to.accountId` — счёт в нашем банке (`INTERNAL`, один вызов `ledger.Transfer`), `to.phone` + `to.bankId` — получатель в другом банке через СБП (`EXTERNAL`, сага). Существование счёта получателя проверяет ledger (`ACCOUNT_NOT_FOUND` → `FAILED`). Шардирование ledger на этапе 6 — его внутреннее дело: для transfer-service внутренний перевод всегда один вызов `Transfer`.
+
 ### gRPC (ledger-service, вызывает transfer-service)
 
 | Метод | Что делает с деньгами |
 |---|---|
 | `CreateAccount` | Открывает счёт клиента с нулевым балансом |
-| `Deposit` | Пополнение: проводки `EXTERNAL_FUNDING` → счёт клиента, тип `FUNDING` |
+| `Deposit` | Пополнение: проводки `EXTERNAL_FUNDING` → счёт клиента. `reference_id` — id пополнения |
 | `Transfer` | Перевод между двумя счетами банка: списание и зачисление одной транзакцией |
 | `Reserve` | Холд: увеличивает `reserved`, доступный остаток уменьшается, баланс пока не меняется |
 | `CommitReserve` | Списывает зарезервированную сумму (проводки) и снимает холд |
 | `ReleaseReserve` | Снимает холд без списания, деньги снова доступны клиенту |
 | `GetAccount` | Возвращает баланс и доступный остаток |
 
-Каждый изменяющий метод принимает `operation_id` — ключ идемпотентности вызова. Если transfer-service не получил ответ и повторил вызов, ledger по `operation_id` поймёт, что операция уже выполнена, и вернёт прежний результат вместо повторного списания.
+Каждый изменяющий метод принимает `reference_id` — id документа-основания (перевода или пополнения), который генерирует вызывающая сторона. Вместе с методом он образует ключ идемпотентности `(reference_id, type)`: если transfer-service не получил ответ и повторил вызов, ledger найдёт операцию и вернёт прежний результат вместо повторного списания.
+
+Бизнес-отказ (недостаточно средств, холд не активен) возвращается в поле результата ответа при успешном gRPC-статусе. Техническая ошибка — gRPC-статус ошибки (`UNAVAILABLE` и т.п.), и вызывающая сторона повторяет вызов.
 
 ### Kafka
 
@@ -306,3 +312,4 @@ Recovery-воркер — фоновый процесс внутри transfer-se
 - [ADR-002: Хранение баланса](adr/0002-balance-storage.md)
 - [ADR-003: Сага вместо 2PC для переводов в другой банк](adr/0003-saga-vs-2pc.md)
 - [ADR-004: Доступ к данным в ledger через EntityManager и свои запросы](adr/0004-data-access-entitymanager.md)
+- [ADR-005: Идемпотентность операций ledger](adr/0005-idempotency.md)
